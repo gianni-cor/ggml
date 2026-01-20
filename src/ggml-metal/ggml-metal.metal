@@ -9988,3 +9988,40 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+
+kernel void kernel_diag_mask_inf_f32(
+    constant ggml_metal_kargs_diag_mask_inf & args [[ buffer(0) ]],
+    device const float                      * src  [[ buffer(1) ]],
+    device float                            * dst  [[ buffer(2) ]],
+    uint                                      row  [[ thread_position_in_grid ]]) {
+
+    const int nc     = args.ne00;   // ncols_x
+    const int nr     = args.ne01;   // rows_per_channel
+    const int nrows  = args.nrows;  // nrows_x
+    const int n_past = args.n_past;
+
+    if ((int)row >= nrows) {
+        return;
+    }
+
+    const int j = row % nr;
+
+    const uint64_t nb0 = args.nb0;
+    const uint64_t nb1 = args.nb1;
+    const uint64_t nb2 = args.nb2;
+
+    const int k = row / nr;
+    const size_t base = k * nb2 + j * nb1;
+
+    for (int col = 0; col < nc; ++col) {
+        const size_t off = base + col * nb0;
+
+        float v = *((device const float *)((device const char *)src + off));
+
+        if (col > n_past + j) {
+            v = -INFINITY;
+        }
+
+        *((device float *)((device char *)dst + off)) = v;
+    }
+}

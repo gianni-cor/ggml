@@ -941,4 +941,14 @@ typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_sgd;
 
+typedef struct {
+    int32_t  ne00;   // nc (number of columns)
+    int32_t  ne01;   // nr (rows per channel)
+    int32_t  nrows;  // total rows
+    int32_t  n_past;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_diag_mask_inf;
+
 #endif // GGML_METAL_IMPL
