@@ -8,6 +8,7 @@ typedef int int32_t;
 typedef uint uint32_t;
 
 #define QK4_0                   32
+#define QK8_0                   32
 
 //------------------------------------------------------------------------------
 // block_q4_0
@@ -16,6 +17,12 @@ struct block_q4_0
 {
     half d;
     uint8_t qs[QK4_0 / 2];
+};
+
+struct block_q8_0
+{
+    half d;
+    int8_t qs[QK8_0];
 };
 
 
@@ -183,5 +190,92 @@ kernel void kernel_get_rows_q4_0(
         dequantize_q4_0_f32(
             ((global struct block_q4_0 *) ((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03)) + ind/NL, ind%NL, &temp);
         *(((global float16 *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1)) + ind) = temp;
+    }
+}
+
+kernel void kernel_get_rows_q8_0(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global void*)((global char*)src0 + offset0);
+    src1 = (global int*)((global char*)src1 + offset1);
+    dst = (global float*)((global char*)dst + offsetd);
+
+    int i10 = get_group_id(0);
+    int i11 = get_group_id(1);
+    int i12 = get_group_id(2);
+
+    int r = ((global int32_t *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    int i02 = i11;
+    int i03 = i12;
+
+    global struct block_q8_0 * src0_row =
+        (global struct block_q8_0 *) ((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03);
+    global float * dst_row =
+        (global float *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        int ib = ind / QK8_0;
+        int iqs = ind % QK8_0;
+        dst_row[ind] = (float) src0_row[ib].d * (float) src0_row[ib].qs[iqs];
+    }
+}
+
+kernel void kernel_get_rows_q8_0_flat(
+        global char * src0_q,
+        global half * src0_d,
+        global int * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src1 = (global int *)((global char *)src1 + offset1);
+    dst  = (global float *)((global char *)dst + offsetd);
+
+    int i10 = get_group_id(0);
+    int i11 = get_group_id(1);
+    int i12 = get_group_id(2);
+
+    int r = ((global int32_t *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    int i02 = i11;
+    int i03 = i12;
+
+    ulong row_offset_blocks = (r*nb01 + i02*nb02 + i03*nb03) / sizeof(struct block_q8_0);
+
+    global float * dst_row =
+        (global float *) ((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        ulong ib = row_offset_blocks + (ulong)(ind / QK8_0);
+        int iqs = ind % QK8_0;
+        dst_row[ind] = (float) src0_d[ib] * (float) src0_q[ib*QK8_0 + (ulong)iqs];
     }
 }
