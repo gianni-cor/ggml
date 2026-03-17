@@ -230,31 +230,35 @@ Further improvements would likely require:
 
 ---
 
-## Runtime memory usage (SD v2.1 Q4_0, 512×512)
+## Metal GPU memory usage (SD v2.1 Q4_0, 512×512)
 
-Measured via `/usr/bin/time -l` on macOS (3 runs each, alternating order).
+Measured via `--verbose` debug output (`ggml_gallocr_get_buffer_size`), showing
+the Metal VRAM compute buffer allocated for each model component.
 
-| Metric | im2col + matmul | Implicit GEMM | Saving |
-|--------|----------------|---------------|--------|
-| Peak RSS avg | 2468 MB | 2429 MB | 39 MB (1.6%) |
-| Peak footprint avg | 2515 MB | 2476 MB | 39 MB (1.6%) |
+### Compute buffer sizes (VRAM)
 
-Detailed runs (peak memory footprint):
+| Component | im2col + matmul | Implicit GEMM | Saving |
+|-----------|----------------|---------------|--------|
+| U-Net (diffusion) | **123.14 MB** | **110.36 MB** | **12.78 MB (10%)** |
+| VAE decode | **1664.06 MB** | **704.06 MB** | **960.00 MB (58%)** |
+| CLIP (text encoder) | 1.89 MB | 1.89 MB | — |
 
-| Run | im2col + matmul | Implicit GEMM | Diff |
-|-----|----------------|---------------|------|
-| 1 | 2520 MB | 2463 MB | 56 MB |
-| 2 | 2506 MB | 2504 MB | 2 MB |
-| 3 | 2521 MB | 2461 MB | 59 MB |
+### Peak GPU memory (params + compute)
 
-The ~40 MB saving is modest because model weights dominate at ~2 GB.
-The im2col path's peak intermediate buffer is ~24 MB (the largest conv layer:
-IC=320, OH×OW=4096, KHW=9 → 4096 × 2880 × 2 bytes = 23.6 MB in f16).
-The implicit GEMM kernel uses only ~16 KB of threadgroup memory.
+| | im2col + matmul | Implicit GEMM | Saving |
+|---|----------------|---------------|--------|
+| Model params (fixed) | 2068.77 MB | 2068.77 MB | — |
+| Peak compute buffer | 1664.06 MB | 704.06 MB | 960.00 MB |
+| **Peak total VRAM** | **3732.83 MB** | **2772.83 MB** | **960.00 MB (26%)** |
 
-The memory advantage would be more significant at higher resolutions (larger
-OH×OW) or with larger models (more IC channels), where the im2col
-intermediate buffer grows proportionally.
+The im2col path allocates massive intermediate buffers that scale with
+OH×OW × IC×KH×KW. The VAE operates at full 512×512 spatial resolution
+with large channel counts, making its im2col buffer enormous (1.66 GB).
+The implicit GEMM kernel uses only threadgroup memory (~16 KB), so the
+compute buffer only holds the input/output tensors themselves.
+
+This is a critical difference for memory-constrained devices: the direct
+path saves **nearly 1 GB of GPU memory** on the VAE decode alone.
 
 ---
 
