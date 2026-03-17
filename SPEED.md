@@ -230,6 +230,34 @@ Further improvements would likely require:
 
 ---
 
+## Runtime memory usage (SD v2.1 Q4_0, 512×512)
+
+Measured via `/usr/bin/time -l` on macOS (3 runs each, alternating order).
+
+| Metric | im2col + matmul | Implicit GEMM | Saving |
+|--------|----------------|---------------|--------|
+| Peak RSS avg | 2468 MB | 2429 MB | 39 MB (1.6%) |
+| Peak footprint avg | 2515 MB | 2476 MB | 39 MB (1.6%) |
+
+Detailed runs (peak memory footprint):
+
+| Run | im2col + matmul | Implicit GEMM | Diff |
+|-----|----------------|---------------|------|
+| 1 | 2520 MB | 2463 MB | 56 MB |
+| 2 | 2506 MB | 2504 MB | 2 MB |
+| 3 | 2521 MB | 2461 MB | 59 MB |
+
+The ~40 MB saving is modest because model weights dominate at ~2 GB.
+The im2col path's peak intermediate buffer is ~24 MB (the largest conv layer:
+IC=320, OH×OW=4096, KHW=9 → 4096 × 2880 × 2 bytes = 23.6 MB in f16).
+The implicit GEMM kernel uses only ~16 KB of threadgroup memory.
+
+The memory advantage would be more significant at higher resolutions (larger
+OH×OW) or with larger models (more IC channels), where the im2col
+intermediate buffer grows proportionally.
+
+---
+
 ## Cross-model validation (version 7)
 
 Repeated benchmarks (3 runs each, alternating order) confirm the improvement is
