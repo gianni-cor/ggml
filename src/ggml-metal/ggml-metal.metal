@@ -4590,8 +4590,8 @@ kernel void kernel_conv_2d(
 
         // --- Load B tile: weights are contiguous, no index decomposition needed ---
         for (int i = lid; i < CONV2D_GEMM_K * CONV2D_GEMM_N; i += 256) {
-            const int kl = i >> 5;       // i / 32
-            const int nl = i & 31;       // i % 32
+            const int kl = i / CONV2D_GEMM_N;
+            const int nl = i % CONV2D_GEMM_N;
             const int k  = k_start + kl;
             const int oc = n_start + nl;
 
@@ -4632,8 +4632,8 @@ kernel void kernel_conv_2d(
 
     // --- Write output to global memory ---
     for (int i = lid; i < CONV2D_GEMM_M * CONV2D_GEMM_N; i += 256) {
-        const int ml = i >> 5;       // i / 32
-        const int nl = i & 31;       // i % 32
+        const int ml = i / CONV2D_GEMM_N;
+        const int nl = i % CONV2D_GEMM_N;
         const int m  = m_start + ml;
         const int oc = n_start + nl;
 

@@ -16,9 +16,9 @@ All times are wall-clock, averaged across 5 denoising steps.
 | 4 | Implicit GEMM v1 (simdgroup 32×32 tiles) | 3.39 s/it | 16.94s | 8.16s | 25.27s | 5.8× |
 | 5 | Implicit GEMM v2 (64×32 tiles, optimized loads) | 1.82 s/it | 9.12s | 3.77s | 12.98s | 10.8× |
 | ~~6~~ | ~~K_TILE 32→64 (rejected)~~ | ~~1.87 s/it~~ | ~~9.36s~~ | ~~3.82s~~ | ~~13.28s~~ | ~~— regression~~ |
-| 7 | **N_TILE 32→64 (64×64 output tile)** | **1.57 s/it** | **7.84s** | **3.01s** | **10.94s** | **12.6×** |
+| 7 | **N_TILE 32→64 (64×64 output tile)** | **1.61 s/it** | **8.05s** | **3.14s** | **11.29s** | **12.2×** |
 
-Version 7 is now **faster than im2col+matmul** (10.94s vs 12.96s, 16% faster).
+Version 7 is **faster than im2col+matmul** (11.29s vs 13.66s avg, 17% faster).
 The direct path also does not allocate the massive im2col intermediate buffer.
 
 ---
@@ -180,16 +180,16 @@ mitigating some of this, the reduced pressure on the memory subsystem is substan
 Additionally, the A load is reused across 8 B sub-tiles instead of 4, raising
 the compute-to-memory ratio from ~2.7 to ~4.3 FMAs per loaded element.
 
-**Result:** Now **faster than im2col+matmul** on every metric:
-- Sampling: 7.84s vs 8.50s (8% faster)
-- VAE decode: 3.01s vs 4.36s (31% faster)
-- Total: 10.94s vs 12.96s (16% faster)
+**Result:** Now **faster than im2col+matmul** on every metric (3-run avg):
+- Sampling: 8.05s vs 8.90s (10% faster)
+- VAE decode: 3.14s vs 4.67s (33% faster)
+- Total: 11.29s vs 13.66s (17% faster)
 
 ```
-  |==================================================| 5/5 - 1.57s/it
-  sampling completed, taking 7.84s
-  decode_first_stage completed, taking 3.01s
-  generate_image completed in 10.94s
+  |==================================================| 5/5 - 1.61s/it
+  sampling completed, taking 8.05s
+  decode_first_stage completed, taking 3.16s
+  generate_image completed in 11.32s
 ```
 
 ---
@@ -203,10 +203,16 @@ real and not due to thermal/scheduling variance.
 
 | Run | Implicit GEMM | im2col + matmul | Speedup |
 |-----|--------------|-----------------|---------|
-| 1 | 1.44 s/it — 10.10s | 1.61 s/it — 12.29s | 18% |
-| 2 | 1.43 s/it — 10.05s | 1.63 s/it — 12.64s | 20% |
-| 3 | 1.48 s/it — 10.28s | 1.62 s/it — 12.44s | 17% |
-| **Avg** | **1.45 s/it — 10.14s** | **1.62 s/it — 12.46s** | **18%** |
+| 1 | 1.61 s/it — 11.32s | 1.81 s/it — 13.84s | 18% |
+| 2 | 1.61 s/it — 11.28s | 1.77 s/it — 13.53s | 17% |
+| 3 | 1.61 s/it — 11.27s | 1.77 s/it — 13.61s | 17% |
+| **Avg** | **1.61 s/it — 11.29s** | **1.78 s/it — 13.66s** | **17%** |
+
+Note: version 7 originally had a B-tile / output-store index bug (hardcoded
+divide-by-32 instead of divide-by-N_TILE when N_TILE=64). The bug was masked
+because the correctness test was compiled without `-DGGML_USE_METAL`, falling
+back to CPU. After fixing the indices, the test now runs on Metal and confirms
+exact match. The numbers above reflect the corrected kernel.
 
 ### SD v2.1 FP16 (f16:1306 — fully float16, no quantization)
 
@@ -221,12 +227,12 @@ real and not due to thermal/scheduling variance.
 
 | Metric | Q4_0 model | FP16 model |
 |--------|-----------|------------|
-| Implicit GEMM avg per step | 1.45 s/it | 1.66 s/it |
-| im2col+matmul avg per step | 1.62 s/it | 1.89 s/it |
-| **Sampling speedup** | **18%** | **21%** |
-| GEMM VAE decode avg | 2.79s | 3.18s |
-| im2col VAE decode avg | 4.25s | 4.90s |
-| **VAE speedup** | **34%** | **35%** |
+| Implicit GEMM avg per step | 1.61 s/it | 1.66 s/it |
+| im2col+matmul avg per step | 1.78 s/it | 1.89 s/it |
+| **Sampling speedup** | **10%** | **21%** |
+| GEMM VAE decode avg | 3.14s | 3.18s |
+| im2col VAE decode avg | 4.67s | 4.90s |
+| **VAE speedup** | **33%** | **35%** |
 
 The speedup holds (and slightly increases) with the fully FP16 model because
 more tensor operations flow through the conv2d kernel. The FP16 model is ~15%
