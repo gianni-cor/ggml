@@ -3376,46 +3376,51 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
     const int32_t d1 = ((const int32_t *) op->op_params)[5];
 
     ggml_metal_kargs_conv_2d args = {
-        /*.nb00 =*/ nb00,
-        /*.nb01 =*/ nb01,
-        /*.nb02 =*/ nb02,
-        /*.nb03 =*/ nb03,
-        /*.nb10 =*/ nb10,
-        /*.nb11 =*/ nb11,
-        /*.nb12 =*/ nb12,
-        /*.nb13 =*/ nb13,
-        /*.nb0  =*/ nb0,
-        /*.nb1  =*/ nb1,
-        /*.nb2  =*/ nb2,
-        /*.nb3  =*/ nb3,
-        /*.IW   =*/ ne10,
-        /*.IH   =*/ ne11,
-        /*.KW   =*/ ne00,
-        /*.KH   =*/ ne01,
-        /*.IC   =*/ ne02,
-        /*.OC   =*/ ne03,
-        /*.OW   =*/ ne0,
-        /*.OH   =*/ ne1,
-        /*.N    =*/ ne3,
-        /*.s0   =*/ s0,
-        /*.s1   =*/ s1,
-        /*.p0   =*/ p0,
-        /*.p1   =*/ p1,
-        /*.d0   =*/ d0,
-        /*.d1   =*/ d1,
+        /*.nb00    =*/ nb00,
+        /*.nb01    =*/ nb01,
+        /*.nb02    =*/ nb02,
+        /*.nb03    =*/ nb03,
+        /*.nb10    =*/ nb10,
+        /*.nb11    =*/ nb11,
+        /*.nb12    =*/ nb12,
+        /*.nb13    =*/ nb13,
+        /*.nb0     =*/ nb0,
+        /*.nb1     =*/ nb1,
+        /*.nb2     =*/ nb2,
+        /*.nb3     =*/ nb3,
+        /*.IW      =*/ ne10,
+        /*.IH      =*/ ne11,
+        /*.KW      =*/ ne00,
+        /*.KH      =*/ ne01,
+        /*.IC      =*/ ne02,
+        /*.OC      =*/ ne03,
+        /*.OW      =*/ ne0,
+        /*.OH      =*/ ne1,
+        /*.N       =*/ ne3,
+        /*.s0      =*/ s0,
+        /*.s1      =*/ s1,
+        /*.p0      =*/ p0,
+        /*.p1      =*/ p1,
+        /*.d0      =*/ d0,
+        /*.d1      =*/ d1,
+        /*.IC_TILE =*/ 0,
+        /*.OC_TILE =*/ 0,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
 
-    int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
-    nth = std::min(nth, 256);
-    nth = std::max(nth, 1);
+    const int M_TILE = 64;
+    const int N_TILE = 32;
+    const int K_TILE = 32;
 
-    const uint64_t n_out = ggml_nelements(op);
+    const int M = ne0 * ne1;
+    const int tg_x = ((int) ne03 + N_TILE - 1) / N_TILE;
+    const int tg_y = (M + M_TILE - 1) / M_TILE;
+    const int tg_z = ne3;
 
-    uint64_t tg = (n_out + nth - 1)/nth;
-    tg = std::max<uint64_t>(tg, 1);
-    tg = std::min<uint64_t>(tg, (uint64_t) std::numeric_limits<int>::max());
+    const size_t smem = GGML_PAD(std::max(
+        (size_t)(M_TILE * K_TILE + K_TILE * N_TILE) * sizeof(uint16_t),
+        (size_t)(M_TILE * N_TILE) * sizeof(float)), 16);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3423,7 +3428,8 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, tg, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, tg_x, tg_y, tg_z, 256, 1, 1);
 
     return 1;
 }

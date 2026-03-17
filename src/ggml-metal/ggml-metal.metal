@@ -4491,95 +4491,168 @@ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 //template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
 //template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
 
+// Implicit GEMM conv2d using simdgroup matrix operations.
+//
+// C[M,N] = A[M,K] * B[K,N] where M=OH*OW, N=OC, K=IC*KH*KW.
+// A is implicit im2col (indices computed on the fly), B is weights.
+//
+// 64×32 output tile, 8 simdgroups each owning 4 accumulators (8×32 strip).
+// Half-precision loads, float accumulators.
+// Weight loading exploits contiguity (single offset, no index decomposition).
+// A-tile loading precomputes (oh,ow) per row, uses incremental k decomposition.
+
+#define CONV2D_GEMM_M 64
+#define CONV2D_GEMM_N 32
+#define CONV2D_GEMM_K 32
+
 template <typename TK>
 kernel void kernel_conv_2d(
         constant ggml_metal_kargs_conv_2d & args,
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]) {
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    const uint threads_per_tg = ntg.x * ntg.y * ntg.z;
-    const uint tg_index = (tgpig.z * tgpg.y + tgpig.y) * tgpg.x + tgpig.x;
-    const uint local_thread = tpitg.z * (ntg.x * ntg.y) + tpitg.y * ntg.x + tpitg.x;
-    const uint thread_index = tg_index * threads_per_tg + local_thread;
-    const uint64_t total_threads = (uint64_t) threads_per_tg * tgpg.x * tgpg.y * tgpg.z;
-    const uint64_t total_outputs = (uint64_t) args.N * args.OC * args.OH * args.OW;
+    const int M   = args.OH * args.OW;
+    const int N   = args.OC;
+    const int KHW = args.KH * args.KW;
+    const int K   = args.IC * KHW;
 
-    for (uint64_t index = thread_index; index < total_outputs; index += total_threads) {
-        uint64_t tmp = index;
+    const int n_start = (int)tgpig.x * CONV2D_GEMM_N;
+    const int m_start = (int)tgpig.y * CONV2D_GEMM_M;
+    const int batch   = (int)tgpig.z;
 
-        const int32_t ow = tmp % args.OW; tmp /= args.OW;
-        const int32_t oh = tmp % args.OH; tmp /= args.OH;
-        const int32_t oc = tmp % args.OC; tmp /= args.OC;
-        const int32_t  n = tmp;
+    if (m_start >= M || n_start >= N) return;
 
-        float acc = 0.0f;
+    const uint64_t src_base = (uint64_t)batch * args.nb13;
+    const int lid = sgitg * 32 + tiisg;
 
-        const int32_t base_x = ow*args.s0 - args.p0;
-        const int32_t base_y = oh*args.s1 - args.p1;
+    // Each of 8 simdgroups owns one 8-row strip across all 32 N columns (4 sub-tiles).
+    const int sg_m = sgitg * 8;
 
-        int32_t ky_start = 0;
-        if (base_y < 0) {
-            ky_start = (-base_y + args.d1 - 1)/args.d1;
-        }
-        int32_t ky_end = args.KH;
-        const int32_t y_max = args.IH - 1 - base_y;
-        if (y_max < 0) {
-            ky_end = ky_start;
-        } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
-            ky_end = min(ky_end, y_max/args.d1 + 1);
-        }
+    simdgroup_float8x8 C0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 C1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 C2 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 C3 = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
-        int32_t kx_start = 0;
-        if (base_x < 0) {
-            kx_start = (-base_x + args.d0 - 1)/args.d0;
-        }
-        int32_t kx_end = args.KW;
-        const int32_t x_max = args.IW - 1 - base_x;
-        if (x_max < 0) {
-            kx_end = kx_start;
-        } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
-            kx_end = min(kx_end, x_max/args.d0 + 1);
-        }
+    threadgroup half * sa = (threadgroup half *)shared_mem;
+    threadgroup half * sb = sa + CONV2D_GEMM_M * CONV2D_GEMM_K;
 
-        if (ky_start < ky_end && kx_start < kx_end) {
-            const uint64_t src_base_n = (uint64_t) n  * args.nb13;
-            const uint64_t w_base_oc  = (uint64_t) oc * args.nb03;
+    // A-tile loading: 256 threads cover 64 rows × 32 cols = 2048 elements (8 per thread).
+    // Assign threads to rows so (oh,ow) is computed once and reused across k elements.
+    // 256 threads / 64 rows = 4 threads per row, each handles 8 consecutive k elements.
+    const int a_row    = lid / 4;           // 0..63
+    const int a_k_base = (lid % 4) * 8;    // 0, 8, 16, 24
+    const int a_m      = m_start + a_row;
+    const int a_oh     = a_m < M ? (a_m / args.OW) : 0;
+    const int a_ow     = a_m < M ? (a_m - a_oh * args.OW) : 0;
+    const int a_by     = a_oh * args.s1 - args.p1;
+    const int a_bx     = a_ow * args.s0 - args.p0;
 
-            for (int32_t ic = 0; ic < args.IC; ++ic) {
-                const uint64_t src_base_nc = src_base_n + (uint64_t) ic * args.nb12;
-                const uint64_t w_base_ocic = w_base_oc  + (uint64_t) ic * args.nb02;
+    for (int k_start = 0; k_start < K; k_start += CONV2D_GEMM_K) {
+        // --- Load A tile: implicit im2col with precomputed spatial + incremental k ---
+        {
+            const int k0 = k_start + a_k_base;
+            int ic  = k0 / KHW;
+            int rem = k0 - ic * KHW;
+            int ky  = rem / args.KW;
+            int kx  = rem - ky * args.KW;
 
-                for (int32_t ky = ky_start; ky < ky_end; ++ky) {
-                    const int32_t iy = base_y + ky*args.d1;
-                    const uint64_t src_base_row = src_base_nc + (uint64_t) iy * args.nb11;
-                    const uint64_t w_base_row   = w_base_ocic + (uint64_t) ky * args.nb01;
+            for (int dk = 0; dk < 8; ++dk) {
+                const int k = k0 + dk;
+                half val = 0;
 
-                    for (int32_t kx = kx_start; kx < kx_end; ++kx) {
-                        const int32_t ix = base_x + kx*args.d0;
-                        const uint64_t src_offs = src_base_row + (uint64_t) ix * args.nb10;
-                        const uint64_t w_offs   = w_base_row   + (uint64_t) kx * args.nb00;
+                if (a_m < M && k < K) {
+                    const int iy = a_by + ky * args.d1;
+                    const int ix = a_bx + kx * args.d0;
 
-                        const float x = *(device const float *)(src + src_offs);
-                        const float w = (float) (*(device const TK *)(weights + w_offs));
+                    if (iy >= 0 && iy < args.IH && ix >= 0 && ix < args.IW) {
+                        val = (half)(*(device const float *)(src + src_base
+                            + (uint64_t)ic * args.nb12
+                            + (uint64_t)iy * args.nb11
+                            + (uint64_t)ix * args.nb10));
+                    }
+                }
+                sa[a_row * CONV2D_GEMM_K + a_k_base + dk] = val;
 
-                        acc += x * w;
+                if (++kx >= args.KW) {
+                    kx = 0;
+                    if (++ky >= args.KH) {
+                        ky = 0;
+                        ++ic;
                     }
                 }
             }
         }
 
-        const uint64_t dst_offs =
-            (uint64_t) n  * args.nb3 +
-            (uint64_t) oc * args.nb2 +
-            (uint64_t) oh * args.nb1 +
-            (uint64_t) ow * args.nb0;
+        // --- Load B tile: weights are contiguous, no index decomposition needed ---
+        for (int i = lid; i < CONV2D_GEMM_K * CONV2D_GEMM_N; i += 256) {
+            const int kl = i >> 5;       // i / 32
+            const int nl = i & 31;       // i % 32
+            const int k  = k_start + kl;
+            const int oc = n_start + nl;
 
-        *(device float *)(dst + dst_offs) = acc;
+            half val = 0;
+            if (k < K && oc < N) {
+                val = (half)(*(device const TK *)(weights
+                    + (uint64_t)oc * args.nb03
+                    + (uint64_t)k  * args.nb00));
+            }
+            sb[i] = val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- GEMM: each simdgroup loads A once, multiplies with 4 B sub-tiles ---
+        for (int kk = 0; kk < CONV2D_GEMM_K; kk += 8) {
+            simdgroup_half8x8 A;
+            simdgroup_half8x8 B0, B1, B2, B3;
+
+            simdgroup_load(A,  sa + sg_m * CONV2D_GEMM_K + kk, CONV2D_GEMM_K);
+            simdgroup_load(B0, sb + kk * CONV2D_GEMM_N,        CONV2D_GEMM_N);
+            simdgroup_load(B1, sb + kk * CONV2D_GEMM_N + 8,    CONV2D_GEMM_N);
+            simdgroup_load(B2, sb + kk * CONV2D_GEMM_N + 16,   CONV2D_GEMM_N);
+            simdgroup_load(B3, sb + kk * CONV2D_GEMM_N + 24,   CONV2D_GEMM_N);
+
+            simdgroup_multiply_accumulate(C0, A, B0, C0);
+            simdgroup_multiply_accumulate(C1, A, B1, C1);
+            simdgroup_multiply_accumulate(C2, A, B2, C2);
+            simdgroup_multiply_accumulate(C3, A, B3, C3);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Store accumulators to shared memory (reuse as float) ---
+    threadgroup float * so = (threadgroup float *)shared_mem;
+
+    simdgroup_store(C0, so + sg_m * CONV2D_GEMM_N,      CONV2D_GEMM_N);
+    simdgroup_store(C1, so + sg_m * CONV2D_GEMM_N + 8,  CONV2D_GEMM_N);
+    simdgroup_store(C2, so + sg_m * CONV2D_GEMM_N + 16, CONV2D_GEMM_N);
+    simdgroup_store(C3, so + sg_m * CONV2D_GEMM_N + 24, CONV2D_GEMM_N);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Write output to global memory ---
+    for (int i = lid; i < CONV2D_GEMM_M * CONV2D_GEMM_N; i += 256) {
+        const int ml = i >> 5;       // i / 32
+        const int nl = i & 31;       // i % 32
+        const int m  = m_start + ml;
+        const int oc = n_start + nl;
+
+        if (m < M && oc < N) {
+            const int oh = m / args.OW;
+            const int ow = m - oh * args.OW;
+
+            *(device float *)(dst
+                + (uint64_t)batch * args.nb3
+                + (uint64_t)oc * args.nb2
+                + (uint64_t)oh * args.nb1
+                + (uint64_t)ow * args.nb0) = so[i];
+        }
     }
 }
 
@@ -4589,10 +4662,10 @@ kernel void kernel_conv_2d<float>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]);
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("kernel_conv_2d_f16_f32")]]
 kernel void kernel_conv_2d<half>(
@@ -4600,10 +4673,10 @@ kernel void kernel_conv_2d<half>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]);
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]);
 
 typedef void (conv_transpose_1d_t)(
         constant ggml_metal_kargs_conv_transpose_1d & args,

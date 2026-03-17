@@ -562,6 +562,8 @@ typedef struct {
     int32_t  p1;
     int32_t  d0;
     int32_t  d1;
+    int32_t  IC_TILE;
+    int32_t  OC_TILE;
 } ggml_metal_kargs_conv_2d;
 
 typedef struct {
