@@ -260,6 +260,33 @@ compute buffer only holds the input/output tensors themselves.
 This is a critical difference for memory-constrained devices: the direct
 path saves **nearly 1 GB of GPU memory** on the VAE decode alone.
 
+### At 768×768 resolution (SD v2.1 Q4_0)
+
+| Component | im2col + matmul | Implicit GEMM | Saving |
+|-----------|----------------|---------------|--------|
+| U-Net (diffusion) | 276.70 MB | 247.94 MB | 28.76 MB (10%) |
+| **VAE decode** | **3744.14 MB** | **1584.14 MB** | **2160.00 MB (58%)** |
+| CLIP (text encoder) | 1.89 MB | 1.89 MB | — |
+| Model params (fixed) | 2068.77 MB | 2068.77 MB | — |
+| **Peak total VRAM** | **5812.91 MB** | **3652.91 MB** | **2160.00 MB (37%)** |
+
+The im2col buffer scales with OH×OW. At 768×768 the VAE compute buffer
+alone reaches **3.7 GB** — exceeding total available memory on an 8 GB Mac
+when combined with model weights. The implicit GEMM path keeps it at 1.6 GB.
+
+### Scaling across resolutions
+
+| Resolution | im2col VAE buffer | GEMM VAE buffer | Saving |
+|------------|------------------|-----------------|--------|
+| 512×512 | 1664 MB | 704 MB | 960 MB (58%) |
+| 768×768 | 3744 MB | 1584 MB | 2160 MB (58%) |
+| 1024×1024 (projected) | ~6656 MB | ~2816 MB | ~3840 MB (58%) |
+
+The 58% saving ratio is constant because the im2col intermediate buffer
+is eliminated entirely. At 1024×1024 the im2col path would need ~6.5 GB
+for VAE alone — infeasible on most Macs. The implicit GEMM path keeps
+it at ~2.8 GB.
+
 ---
 
 ## Cross-model validation (version 7)
