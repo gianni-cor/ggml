@@ -16,9 +16,11 @@ All times are wall-clock, averaged across 5 denoising steps.
 | 3 | OC tiling (4 output channels per threadgroup) | 7.22 s/it | 36.74s | 19.22s | 56.04s | 2.7× |
 | 4 | Implicit GEMM v1 (simdgroup 32×32 tiles) | 3.39 s/it | 16.94s | 8.16s | 25.27s | 5.8× |
 | 5 | Implicit GEMM v2 (64×32 tiles, optimized loads) | 1.82 s/it | 9.12s | 3.77s | 12.98s | 10.8× |
+| ~~6~~ | ~~K_TILE 32→64 (rejected)~~ | ~~1.87 s/it~~ | ~~9.36s~~ | ~~3.82s~~ | ~~13.28s~~ | ~~— regression~~ |
+| 7 | **N_TILE 32→64 (64×64 output tile)** | **1.57 s/it** | **7.84s** | **3.01s** | **10.94s** | **12.6×** |
 
-Version 5 matches the im2col+matmul default path end-to-end (12.98s vs 12.96s).
-The direct path has an advantage: it does not allocate the massive im2col intermediate buffer.
+Version 7 is now **faster than im2col+matmul** (10.94s vs 12.96s, 16% faster).
+The direct path also does not allocate the massive im2col intermediate buffer.
 
 ---
 
@@ -139,6 +141,56 @@ with IC=640 at 32×32, that's ~18 MB per operation. The direct path needs only
   sampling completed, taking 9.12s
   decode_first_stage completed, taking 3.77s
   generate_image completed in 12.98s
+```
+
+### 6. K_TILE 32→64 (REJECTED) — 1.87 s/it (regression)
+
+**What changed:** Doubled the K-tile from 32 to 64, halving the number of K iterations
+and threadgroup barriers. Shared memory increased from 6 KB to 12 KB.
+Each thread loads 16 k-elements per A-tile instead of 8.
+
+**Why it regressed:** The extra per-thread loading work (16 vs 8 elements per strip)
+outweighed the barrier savings. The incremental k-decomposition loop doubled, adding
+more integer increment/compare overhead. The GPU is already fully utilized at K_TILE=32;
+larger tiles just shift work from synchronization overhead to loading overhead without
+improving the compute-to-memory ratio (the GEMM inner loop doubles too, but so does
+the data it operates on — same ratio).
+
+**Decision:** Reverted. K_TILE=32 remains optimal.
+
+```
+  |==================================================| 5/5 - 1.87s/it
+  sampling completed, taking 9.36s
+  decode_first_stage completed, taking 3.82s
+  generate_image completed in 13.28s
+```
+
+### 7. N_TILE 32→64 (64×64 output tile) — 1.57 s/it (+12.6×)
+
+**What changed:** Doubled the N-tile from 32 to 64 output channels per threadgroup.
+Each simdgroup now owns 8 accumulators (C[0]..C[7]) covering a full 8×64 strip.
+Per kk iteration: 1 A load reused across 8 B loads + 8 MMA ops (was 4+4).
+Shared memory: A = 4 KB + B = 4 KB = 8 KB (half), output = 16 KB (float).
+
+**Why it helped:** The key win is reducing redundant input reads across the
+N dimension. With N_TILE=32, every M-tile's input data was loaded by OC/32
+threadgroups independently. With N_TILE=64, that's halved to OC/64 threadgroups.
+For OC=320: 10 → 5 redundant loads; for OC=640: 20 → 10. Even with L2 cache
+mitigating some of this, the reduced pressure on the memory subsystem is substantial.
+
+Additionally, the A load is reused across 8 B sub-tiles instead of 4, raising
+the compute-to-memory ratio from ~2.7 to ~4.3 FMAs per loaded element.
+
+**Result:** Now **faster than im2col+matmul** on every metric:
+- Sampling: 7.84s vs 8.50s (8% faster)
+- VAE decode: 3.01s vs 4.36s (31% faster)
+- Total: 10.94s vs 12.96s (16% faster)
+
+```
+  |==================================================| 5/5 - 1.57s/it
+  sampling completed, taking 7.84s
+  decode_first_stage completed, taking 3.01s
+  generate_image completed in 10.94s
 ```
 
 ---

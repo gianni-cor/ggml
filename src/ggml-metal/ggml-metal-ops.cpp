@@ -3410,7 +3410,7 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
 
     const int M_TILE = 64;
-    const int N_TILE = 32;
+    const int N_TILE = 64;
     const int K_TILE = 32;
 
     const int M = ne0 * ne1;

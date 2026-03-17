@@ -4502,7 +4502,7 @@ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 // A-tile loading precomputes (oh,ow) per row, uses incremental k decomposition.
 
 #define CONV2D_GEMM_M 64
-#define CONV2D_GEMM_N 32
+#define CONV2D_GEMM_N 64
 #define CONV2D_GEMM_K 32
 
 template <typename TK>
@@ -4530,13 +4530,13 @@ kernel void kernel_conv_2d(
     const uint64_t src_base = (uint64_t)batch * args.nb13;
     const int lid = sgitg * 32 + tiisg;
 
-    // Each of 8 simdgroups owns one 8-row strip across all 32 N columns (4 sub-tiles).
+    // Each of 8 simdgroups owns one 8-row strip across all 64 N columns (8 sub-tiles).
     const int sg_m = sgitg * 8;
 
-    simdgroup_float8x8 C0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    simdgroup_float8x8 C1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    simdgroup_float8x8 C2 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    simdgroup_float8x8 C3 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 C[8];
+    for (int i = 0; i < 8; i++) {
+        C[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
 
     threadgroup half * sa = (threadgroup half *)shared_mem;
     threadgroup half * sb = sa + CONV2D_GEMM_M * CONV2D_GEMM_K;
@@ -4606,21 +4606,16 @@ kernel void kernel_conv_2d(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- GEMM: each simdgroup loads A once, multiplies with 4 B sub-tiles ---
+        // --- GEMM: each simdgroup loads A once, multiplies with 8 B sub-tiles ---
         for (int kk = 0; kk < CONV2D_GEMM_K; kk += 8) {
             simdgroup_half8x8 A;
-            simdgroup_half8x8 B0, B1, B2, B3;
+            simdgroup_load(A, sa + sg_m * CONV2D_GEMM_K + kk, CONV2D_GEMM_K);
 
-            simdgroup_load(A,  sa + sg_m * CONV2D_GEMM_K + kk, CONV2D_GEMM_K);
-            simdgroup_load(B0, sb + kk * CONV2D_GEMM_N,        CONV2D_GEMM_N);
-            simdgroup_load(B1, sb + kk * CONV2D_GEMM_N + 8,    CONV2D_GEMM_N);
-            simdgroup_load(B2, sb + kk * CONV2D_GEMM_N + 16,   CONV2D_GEMM_N);
-            simdgroup_load(B3, sb + kk * CONV2D_GEMM_N + 24,   CONV2D_GEMM_N);
-
-            simdgroup_multiply_accumulate(C0, A, B0, C0);
-            simdgroup_multiply_accumulate(C1, A, B1, C1);
-            simdgroup_multiply_accumulate(C2, A, B2, C2);
-            simdgroup_multiply_accumulate(C3, A, B3, C3);
+            for (int ni = 0; ni < 8; ni++) {
+                simdgroup_half8x8 B;
+                simdgroup_load(B, sb + kk * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
+                simdgroup_multiply_accumulate(C[ni], A, B, C[ni]);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4629,10 +4624,9 @@ kernel void kernel_conv_2d(
     // --- Store accumulators to shared memory (reuse as float) ---
     threadgroup float * so = (threadgroup float *)shared_mem;
 
-    simdgroup_store(C0, so + sg_m * CONV2D_GEMM_N,      CONV2D_GEMM_N);
-    simdgroup_store(C1, so + sg_m * CONV2D_GEMM_N + 8,  CONV2D_GEMM_N);
-    simdgroup_store(C2, so + sg_m * CONV2D_GEMM_N + 16, CONV2D_GEMM_N);
-    simdgroup_store(C3, so + sg_m * CONV2D_GEMM_N + 24, CONV2D_GEMM_N);
+    for (int ni = 0; ni < 8; ni++) {
+        simdgroup_store(C[ni], so + sg_m * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
+    }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
