@@ -192,6 +192,42 @@ the compute-to-memory ratio from ~2.7 to ~4.3 FMAs per loaded element.
   generate_image completed in 11.32s
 ```
 
+### 8. 1×1 conv fast path + barrier-free output store (no measurable change)
+
+**What changed:**
+
+1. **Specialized A-tile loading for KHW==1:** When KH=KW=1 (1×1 convolutions,
+   used in attention projections and skip connections), the A-tile load skips
+   k-decomposition, padding checks, and ky/kx logic. Direct: `src[batch][ic][oh][ow]`.
+
+2. **Barrier-free output store:** Each simdgroup writes to non-overlapping rows
+   (sg_m through sg_m+7), so the threadgroup_barrier between simdgroup_store and
+   the write-to-global phase is unnecessary. Removed it and switched to per-simdgroup
+   cooperative writes (32 threads write 512 elements = 16 each).
+
+**Result:** 1.60 s/it avg (vs 1.61 s/it for v7). Within measurement noise.
+The 1×1 fast path doesn't measurably help because 3×3 convolutions dominate SD
+compute time. The barrier removal saves ~100 cycles per threadgroup — negligible
+compared to the K-loop's hundreds of barriers.
+
+**Decision:** Kept (cleaner code, no regression) but does not warrant a new table row.
+
+---
+
+## Remaining optimization avenues
+
+The kernel is now within ~10% of a theoretical pure GEMM on the same hardware.
+Further improvements would likely require:
+
+- **Data layout change (NCHW→NHWC):** Would make the channel dimension contiguous
+  with spatial dimensions, enabling vectorized loads for the A-tile instead of
+  strided IC access. Requires changes throughout the ggml conv2d pipeline.
+- **Double buffering:** Overlap next tile's cooperative load with current tile's
+  GEMM. Requires 2× shared memory and careful thread-level scheduling.
+  Metal lacks async copy (unlike CUDA's cp.async), limiting the benefit.
+- **Larger M tile (128×64):** Would require 16 simdgroups (512 threads) or more
+  accumulators per simdgroup. Apple Silicon threadgroup limits may constrain this.
+
 ---
 
 ## Cross-model validation (version 7)

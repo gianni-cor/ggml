@@ -4552,9 +4552,27 @@ kernel void kernel_conv_2d(
     const int a_by     = a_oh * args.s1 - args.p1;
     const int a_bx     = a_ow * args.s0 - args.p0;
 
+    // Precompute src offset for 1×1 fast path (no padding, no kernel spatial)
+    const uint64_t a_src_spatial = src_base
+        + (uint64_t)a_oh * args.nb11
+        + (uint64_t)a_ow * args.nb10;
+
     for (int k_start = 0; k_start < K; k_start += CONV2D_GEMM_K) {
-        // --- Load A tile: implicit im2col with precomputed spatial + incremental k ---
-        {
+        // --- Load A tile: implicit im2col ---
+        if (KHW == 1) {
+            // Fast path for 1×1 convolutions: k maps directly to ic,
+            // no kernel spatial dims, no padding, no bounds checks needed.
+            for (int dk = 0; dk < 8; ++dk) {
+                const int ic = k_start + a_k_base + dk;
+                half val = 0;
+                if (a_m < M && ic < args.IC) {
+                    val = (half)(*(device const float *)(src + a_src_spatial
+                        + (uint64_t)ic * args.nb12));
+                }
+                sa[a_row * CONV2D_GEMM_K + a_k_base + dk] = val;
+            }
+        } else {
+            // General path with incremental (ic, ky, kx) decomposition
             const int k0 = k_start + a_k_base;
             int ic  = k0 / KHW;
             int rem = k0 - ic * KHW;
@@ -4621,18 +4639,17 @@ kernel void kernel_conv_2d(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // --- Store accumulators to shared memory (reuse as float) ---
+    // --- Store accumulators and write to global ---
+    // Each simdgroup writes to non-overlapping rows [sg_m..sg_m+7], no barrier needed.
     threadgroup float * so = (threadgroup float *)shared_mem;
 
     for (int ni = 0; ni < 8; ni++) {
         simdgroup_store(C[ni], so + sg_m * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // --- Write output to global memory ---
-    for (int i = lid; i < CONV2D_GEMM_M * CONV2D_GEMM_N; i += 256) {
-        const int ml = i / CONV2D_GEMM_N;
+    // Each simdgroup's 32 threads write their own 8×64 block (16 elements per thread)
+    for (int i = tiisg; i < 8 * CONV2D_GEMM_N; i += 32) {
+        const int ml = sg_m + i / CONV2D_GEMM_N;
         const int nl = i % CONV2D_GEMM_N;
         const int m  = m_start + ml;
         const int oc = n_start + nl;
@@ -4645,7 +4662,7 @@ kernel void kernel_conv_2d(
                 + (uint64_t)batch * args.nb3
                 + (uint64_t)oc * args.nb2
                 + (uint64_t)oh * args.nb1
-                + (uint64_t)ow * args.nb0) = so[i];
+                + (uint64_t)ow * args.nb0) = so[ml * CONV2D_GEMM_N + nl];
         }
     }
 }
