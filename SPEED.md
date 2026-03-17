@@ -279,8 +279,10 @@ linear) using full f16 instead of quantized weights.
 
 ## Correctness
 
-Verified via `test-conv2d-direct` which compares `ggml_conv_2d_direct` against
-`ggml_conv_2d` (im2col+matmul) across 14 configurations:
+Verified via `test-conv2d-direct` (compiled with `-DGGML_USE_METAL`) which
+compares `ggml_conv_2d_direct` (`GGML_OP_CONV_2D`, 1 graph node) against
+`ggml_conv_2d` (`IM2COL + MUL_MAT + reshapes`, 7 graph nodes) across 14
+configurations:
 
 - 3×3 convolutions: IC/OC 10–640, spatial 8×6 to 64×64
 - 1×1 projections: IC/OC 320–640
@@ -288,3 +290,14 @@ Verified via `test-conv2d-direct` which compares `ggml_conv_2d_direct` against
 - Edge cases: no padding, non-square spatial, non-tile-aligned OC, small IC/OC
 
 All 14 tests pass with max_abs=0.0000, max_rel=0.0000%.
+
+**Why exact zero?** Both paths produce bit-identical results despite using
+different kernels (`kernel_conv_2d` vs `kernel_mul_mm`) because:
+1. Both convert input to f16 with the same rounding
+2. Both use `simdgroup_multiply_accumulate` (8×8 hardware MMA, f16 inputs, f32 accumulator)
+3. Both walk the K dimension monotonically (k=0..7, 8..15, ...) regardless of K_TILE
+4. The K_TILE boundary only affects barrier timing, not accumulation order
+
+Confirmed via diagnostic test: Metal values differ from CPU (e.g. -1.695035 vs
+-1.692139 for the same element), proving Metal is actually running. Within Metal,
+both paths match exactly.
