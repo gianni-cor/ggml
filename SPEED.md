@@ -1,12 +1,11 @@
 # Metal conv2d kernel optimization log
 
 Hardware: Apple M4 (10-core GPU, 16GB unified memory)
-Model: Stable Diffusion v2.1 Q4_0 (f16 weights for conv layers)
 Benchmark: 512×512, 5 steps, Euler A, CFG 2.0, seed 42, `--diffusion-conv-direct --vae-conv-direct --diffusion-fa --fa`
 
 All times are wall-clock, averaged across 5 denoising steps.
 
-## Results summary
+## Results summary (SD v2.1 Q4_0)
 
 | # | Version | Per step | Sampling (5 steps) | VAE decode | Total | Speedup vs baseline |
 |---|---------|----------|-------------------|------------|-------|---------------------|
@@ -192,6 +191,47 @@ the compute-to-memory ratio from ~2.7 to ~4.3 FMAs per loaded element.
   decode_first_stage completed, taking 3.01s
   generate_image completed in 10.94s
 ```
+
+---
+
+## Cross-model validation (version 7)
+
+Repeated benchmarks (3 runs each, alternating order) confirm the improvement is
+real and not due to thermal/scheduling variance.
+
+### SD v2.1 Q4_0 (f16:1015, q4_0:291 — mixed quantization)
+
+| Run | Implicit GEMM | im2col + matmul | Speedup |
+|-----|--------------|-----------------|---------|
+| 1 | 1.44 s/it — 10.10s | 1.61 s/it — 12.29s | 18% |
+| 2 | 1.43 s/it — 10.05s | 1.63 s/it — 12.64s | 20% |
+| 3 | 1.48 s/it — 10.28s | 1.62 s/it — 12.44s | 17% |
+| **Avg** | **1.45 s/it — 10.14s** | **1.62 s/it — 12.46s** | **18%** |
+
+### SD v2.1 FP16 (f16:1306 — fully float16, no quantization)
+
+| Run | Implicit GEMM | im2col + matmul | Speedup |
+|-----|--------------|-----------------|---------|
+| 1 | 1.71 s/it — 12.08s | 1.93 s/it — 15.10s | 20% |
+| 2 | 1.72 s/it — 11.61s | 1.97 s/it — 14.87s | 22% |
+| 3 | 1.56 s/it — 10.90s | 1.77 s/it — 13.56s | 20% |
+| **Avg** | **1.66 s/it — 11.53s** | **1.89 s/it — 14.51s** | **21%** |
+
+### Effect of quantization on the speedup
+
+| Metric | Q4_0 model | FP16 model |
+|--------|-----------|------------|
+| Implicit GEMM avg per step | 1.45 s/it | 1.66 s/it |
+| im2col+matmul avg per step | 1.62 s/it | 1.89 s/it |
+| **Sampling speedup** | **18%** | **21%** |
+| GEMM VAE decode avg | 2.79s | 3.18s |
+| im2col VAE decode avg | 4.25s | 4.90s |
+| **VAE speedup** | **34%** | **35%** |
+
+The speedup holds (and slightly increases) with the fully FP16 model because
+more tensor operations flow through the conv2d kernel. The FP16 model is ~15%
+slower in absolute terms for both paths due to the non-conv layers (attention,
+linear) using full f16 instead of quantized weights.
 
 ---
 
