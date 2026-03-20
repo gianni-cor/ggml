@@ -7758,7 +7758,7 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
 
     const uint32_t BS_K = 64;
     const uint32_t BS_NPQ = 64;
-    const uint32_t BS_CRS = 16;
+    const uint32_t BS_CRS = 32;
     const uint32_t VEC_SIZE = 4;
 
     const uint32_t TS_K = 4;

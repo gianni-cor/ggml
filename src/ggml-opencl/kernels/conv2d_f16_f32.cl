@@ -12,7 +12,7 @@
 
 #define BS_K 64
 #define BS_NPQ 64
-#define BS_CRS 16
+#define BS_CRS 32
 
 #define TS_K 4
 #define TS_NPQ 8
@@ -48,7 +48,8 @@ kernel void kernel_conv_2d(
     global float* dst_data = (global float*) ((global char*)p_dst + off_dst);
 
     const uint K = Cout;
-    const uint CRS = Cin*KH*KW;
+    const uint KHW = KH * KW;
+    const uint CRS = Cin * KHW;
     const uint NPQ = N*OH*OW;
 
     const uint lid_k = get_local_id(0);
@@ -72,6 +73,8 @@ kernel void kernel_conv_2d(
     }
 
     const uint NB_CRS = splitWork(CRS, BS_CRS);
+    const bool is_1x1 = (KH == 1 && KW == 1);
+    const bool knl_contiguous = (nb01 == KW && nb02 == KHW);
 
     for (uint B_idx_CRS = 0; B_idx_CRS < NB_CRS; ++B_idx_CRS) {
         const uint offset_crs = B_idx_CRS * BS_CRS;
@@ -83,44 +86,77 @@ kernel void kernel_conv_2d(
             const uint crs_g = offset_crs + crs_l;
 
             if (k_g < K && crs_g < CRS) {
-                const uint Cin_idx = crs_g / (KW*KH);
-                const uint KH_idx = (crs_g - Cin_idx*KW*KH) / KW;
-                const uint KW_idx = crs_g - Cin_idx*KW*KH - KH_idx*KW;
-                const uint knl_idx = KW_idx + KH_idx*nb01 + Cin_idx*nb02 + k_g*nb03;
-                Ash[k_l * BS_CRS + crs_l] = knl_data[knl_idx];
+                if (is_1x1) {
+                    Ash[k_l * BS_CRS + crs_l] = knl_data[crs_g * nb02 + k_g * nb03];
+                } else if (knl_contiguous) {
+                    Ash[k_l * BS_CRS + crs_l] = knl_data[k_g * nb03 + crs_g];
+                } else {
+                    const uint Cin_idx = crs_g / KHW;
+                    const uint rem = crs_g - Cin_idx * KHW;
+                    const uint KH_idx = rem / KW;
+                    const uint KW_idx = rem - KH_idx * KW;
+                    Ash[k_l * BS_CRS + crs_l] = knl_data[KW_idx + KH_idx*nb01 + Cin_idx*nb02 + k_g*nb03];
+                }
             } else {
                 Ash[k_l * BS_CRS + crs_l] = (half)0.0f;
             }
         }
 
-        for (int i = tid; i < BS_CRS * BS_NPQ_VEC; i += (WG_K * WG_NPQ)) {
-            const uint crs_l = i / BS_NPQ_VEC;
-            const uint npq_l_vec = i % BS_NPQ_VEC;
-            const uint crs_g = offset_crs + crs_l;
+        if (is_1x1) {
+            for (int i = tid; i < BS_CRS * BS_NPQ_VEC; i += (WG_K * WG_NPQ)) {
+                const uint crs_l = i / BS_NPQ_VEC;
+                const uint npq_l_vec = i % BS_NPQ_VEC;
+                const uint ic = offset_crs + crs_l;
 
-            float4 val = (float4)(0.0f);
-            if (crs_g < CRS) {
-                const uint Cin_idx = crs_g / (KW * KH);
-                const uint KH_idx = (crs_g - Cin_idx * KW * KH) / KW;
-                const uint KW_idx = crs_g - Cin_idx * KW * KH - KH_idx * KW;
-                for (int v = 0; v < VEC_SIZE; ++v) {
-                    const uint npq_g = offset_npq + npq_l_vec * VEC_SIZE + v;
-                    if (npq_g < NPQ) {
-                        const uint N_idx = npq_g / (OH * OW);
-                        const uint pq_idx = npq_g % (OH * OW);
-                        const uint OH_idx = pq_idx / OW;
-                        const uint OW_idx = pq_idx % OW;
-                        const int H_idx = (int)(OH_idx * s1 + KH_idx * d1 - p1);
-                        const int W_idx = (int)(OW_idx * s0 + KW_idx * d0 - p0);
-
-                        if (H_idx >= 0 && H_idx < H && W_idx >= 0 && W_idx < W) {
-                            const uint src_idx = W_idx + H_idx * nb11 + Cin_idx * nb12 + N_idx * nb13;
-                            ((float*)&val)[v] = src_data[src_idx];
+                float4 val = (float4)(0.0f);
+                if (ic < Cin) {
+                    for (int v = 0; v < VEC_SIZE; ++v) {
+                        const uint npq_g = offset_npq + npq_l_vec * VEC_SIZE + v;
+                        if (npq_g < NPQ) {
+                            const uint N_idx = npq_g / (OH * OW);
+                            const uint pq_idx = npq_g - N_idx * (OH * OW);
+                            const uint OH_idx = pq_idx / OW;
+                            const uint OW_idx = pq_idx - OH_idx * OW;
+                            const int H_idx = (int)(OH_idx * s1) - (int)p1;
+                            const int W_idx = (int)(OW_idx * s0) - (int)p0;
+                            if (H_idx >= 0 && (uint)H_idx < H && W_idx >= 0 && (uint)W_idx < W) {
+                                ((float*)&val)[v] = src_data[W_idx + H_idx * nb11 + ic * nb12 + N_idx * nb13];
+                            }
                         }
                     }
                 }
+                Bsh[crs_l * BS_NPQ_VEC + npq_l_vec] = val;
             }
-            Bsh[crs_l * BS_NPQ_VEC + npq_l_vec] = val;
+        } else {
+            for (int i = tid; i < BS_CRS * BS_NPQ_VEC; i += (WG_K * WG_NPQ)) {
+                const uint crs_l = i / BS_NPQ_VEC;
+                const uint npq_l_vec = i % BS_NPQ_VEC;
+                const uint crs_g = offset_crs + crs_l;
+
+                float4 val = (float4)(0.0f);
+                if (crs_g < CRS) {
+                    const uint Cin_idx = crs_g / KHW;
+                    const uint rem = crs_g - Cin_idx * KHW;
+                    const uint KH_idx = rem / KW;
+                    const uint KW_idx = rem - KH_idx * KW;
+                    for (int v = 0; v < VEC_SIZE; ++v) {
+                        const uint npq_g = offset_npq + npq_l_vec * VEC_SIZE + v;
+                        if (npq_g < NPQ) {
+                            const uint N_idx = npq_g / (OH * OW);
+                            const uint pq_idx = npq_g - N_idx * (OH * OW);
+                            const uint OH_idx = pq_idx / OW;
+                            const uint OW_idx = pq_idx - OH_idx * OW;
+                            const int H_idx = (int)(OH_idx * s1 + KH_idx * d1) - (int)p1;
+                            const int W_idx = (int)(OW_idx * s0 + KW_idx * d0) - (int)p0;
+
+                            if (H_idx >= 0 && (uint)H_idx < H && W_idx >= 0 && (uint)W_idx < W) {
+                                ((float*)&val)[v] = src_data[W_idx + H_idx * nb11 + Cin_idx * nb12 + N_idx * nb13];
+                            }
+                        }
+                    }
+                }
+                Bsh[crs_l * BS_NPQ_VEC + npq_l_vec] = val;
+            }
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);
