@@ -144,6 +144,7 @@ set(GGML_OPENCL_KERNELS
     tsembd
     upscale
     tanh
+    sin
     exp
     expm1
     softplus
@@ -153,6 +154,8 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f16_f32_kq_kqv
     conv2d
     conv2d_f16_f32
+    conv_transpose_1d_f32
+    conv_transpose_1d_f16_f32
     flash_attn_f32_f16
     flash_attn_f16
     flash_attn_f32

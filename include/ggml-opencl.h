@@ -11,6 +11,7 @@ extern "C" {
 //
 // backend API
 //
+// May return NULL when no OpenCL device is available or the driver/context failed to init.
 GGML_BACKEND_API ggml_backend_t ggml_backend_opencl_init(void);
 GGML_BACKEND_API bool ggml_backend_is_opencl(ggml_backend_t backend);
 
